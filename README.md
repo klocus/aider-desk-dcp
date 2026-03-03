@@ -22,13 +22,13 @@ This extension automatically manages conversation context to optimize token usag
 **Download to global extensions**
 ```
 curl -o ~/.aider-desk/extensions/dynamic-context-pruning.ts \
-  https://raw.githubusercontent.com/klocus/aider-desk-dcp/refs/heads/master/dynamic-context-pruning.ts
+  https://raw.githubusercontent.com/klocus/aider-desk-dcp/master/dynamic-context-pruning.ts
 ```
 
 **Download to project extensions**
 ```
 curl -o ./.aider-desk/extensions/dynamic-context-pruning.ts \
-  https://raw.githubusercontent.com/klocus/aider-desk-dcp/refs/heads/master/dynamic-context-pruning.ts
+  https://raw.githubusercontent.com/klocus/aider-desk-dcp/master/dynamic-context-pruning.ts
 ```
 
 ## Usage
