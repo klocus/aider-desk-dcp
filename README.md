@@ -1,6 +1,6 @@
 # Dynamic Context Pruning (DCP) Extension for AiderDesk
 
-This extension intelligently manages conversation context to optimize token usage, similar to OpenCode's DCP.
+This extension automatically manages conversation context to optimize token usage, similar to OpenCode's DCP.
 
 ## Features
 
