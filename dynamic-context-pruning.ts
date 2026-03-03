@@ -18,8 +18,32 @@ import type {
 
 const PRUNED_ERROR_INPUT = '[DCP: input removed — failed tool call]';
 
-/** Tools whose outputs should never be pruned */
-const PROTECTED_TOOLS = new Set(['dcp-prune', 'dcp-distill']);
+/**
+ * Tools whose outputs should never be pruned (blacklist approach).
+ * Deduplication & error purging run on ALL tools except these.
+ * Matches against the full tool name using substring checks.
+ */
+const PROTECTED_TOOL_PATTERNS = [
+  // DCP's own tools
+  'dcp-prune',
+  'dcp-distill',
+  // AiderDesk native tool groups — these should never be pruned as they manage core task state
+  'tasks---',
+  'todo---',
+  'skills---',
+  'memory---',
+  'subagents---',
+  // Aider code generation — unique creative output, not idempotent
+  'run_prompt',
+  // Aider context file management — tracks which files are in context
+  'get_context_files',
+  'add_context_files',
+  'drop_context_files'
+];
+
+function isProtectedTool(name: string): boolean {
+  return PROTECTED_TOOL_PATTERNS.some(p => name === p || name.includes(p));
+}
 
 const DCP_SYSTEM_HINT = [
   '',
@@ -62,24 +86,55 @@ function toolSignature(toolName: string, input: unknown): string {
   return `${toolName}::${JSON.stringify(normalizeForSignature(input))}`;
 }
 
+/** Detects tools that modify file contents or produce non-idempotent output */
 function isWriteTool(name: string): boolean {
+  const n = name.toLowerCase();
   return (
-    name.includes('file_write') ||
-    name.includes('file_edit') ||
-    name.includes('write_file') ||
-    name.includes('edit_file') ||
-    name === 'write' ||
-    name === 'edit'
+    // AiderDesk power tools
+    n.includes('file_write') || // power---file_write
+    n.includes('file_edit') || // power---file_edit
+    // AiderDesk Aider tools
+    n.includes('run_prompt') || // run_prompt — Aider code generation, not idempotent
+    // Shell execution — not idempotent and has side effects, must never be deduped
+    n.includes('bash') || // power---bash
+    // Generic write patterns (MCP servers, other tools)
+    n.includes('write_file') ||
+    n.includes('edit_file') ||
+    n.includes('create_file') ||
+    n.includes('file_create') ||
+    n.includes('replace_in_file') ||
+    n.includes('replace_string') ||
+    n.includes('apply_patch') ||
+    n.includes('apply_diff') ||
+    n.includes('insert_code') ||
+    n.includes('multi_edit') ||
+    n.includes('multiedit') ||
+    n === 'write' ||
+    n === 'edit'
   );
 }
 
+/** Detects tools that read file contents or search the filesystem */
 function isReadTool(name: string): boolean {
+  const n = name.toLowerCase();
   return (
-    name.includes('file_read') ||
-    name.includes('read_file') ||
-    name.includes('grep') ||
-    name.includes('glob') ||
-    name === 'read'
+    // AiderDesk power tools
+    n.includes('file_read') || // power---file_read
+    n.includes('grep') || // power---grep
+    n.includes('glob') || // power---glob
+    n.includes('semantic_search') || // power---semantic_search
+    n.includes('fetch') || // power---fetch — reads web content
+    // AiderDesk Aider tools
+    n.includes('get_context_files') || // get_context_files — lists files in Aider context
+    // Generic read/search patterns (MCP servers, other tools)
+    n.includes('read_file') ||
+    n.includes('search') || // also covers semantic_search, search_task etc.
+    n.includes('find') ||
+    n.includes('list_dir') ||
+    n.includes('list_file') ||
+    n.includes('cat') ||
+    n.includes('view') ||
+    n === 'read'
   );
 }
 
@@ -92,7 +147,7 @@ function outputSize(output: ToolResultOutput): number {
 
 function extractPath(input: Record<string, unknown> | undefined): string | undefined {
   if (!input) return undefined;
-  const p = input.filePath ?? input.path ?? input.filePattern ?? input.pattern;
+  const p = input.filePath ?? input.path ?? input.file ?? input.filePattern ?? input.pattern ?? input.filename;
   return typeof p === 'string' ? p : undefined;
 }
 
@@ -147,7 +202,7 @@ export default class DCPExtension implements Extension {
   private pruneToolMessage(msg: ContextToolMessage, reason: string): { msg: ContextToolMessage; count: number } {
     let count = 0;
     const newContent = msg.content.map(part => {
-      if (PROTECTED_TOOLS.has(part.toolName)) return part;
+      if (isProtectedTool(part.toolName)) return part;
       const pruned = this.prunePart(part, reason);
       if (pruned !== part) count++;
       return pruned;
@@ -186,6 +241,7 @@ export default class DCPExtension implements Extension {
     const messages: ContextMessage[] = [...event.optimizedMessages];
     let changed = false;
     const counts = { duplicate: 0, supersede: 0, error: 0, manual: 0, distill: 0 };
+    const seenSizeBefore = this.seenToolCallIds.size;
 
     // --- Phase 0: Build tool call lookup from assistant messages ---
     const toolCalls = new Map<string, ToolCallRef>();
@@ -244,7 +300,9 @@ export default class DCPExtension implements Extension {
       for (let j = 0; j < toolMsg.content.length; j++) {
         const part = toolMsg.content[j];
         if (part.output.type === 'text' && part.output.value.startsWith('[DCP:')) continue;
-        if (PROTECTED_TOOLS.has(part.toolName)) continue;
+        if (isProtectedTool(part.toolName)) continue;
+        // Don't dedup write/edit tools — same params doesn't mean same result (file may have changed)
+        if (isWriteTool(part.toolName)) continue;
 
         const ref = toolCalls.get(part.toolCallId);
         const sig = toolSignature(part.toolName, ref?.input);
@@ -310,7 +368,7 @@ export default class DCPExtension implements Extension {
       if (messages[i].role !== 'tool') continue;
       const toolMsg = messages[i] as ContextToolMessage;
       for (const part of toolMsg.content) {
-        if (PROTECTED_TOOLS.has(part.toolName)) continue;
+        if (isProtectedTool(part.toolName)) continue;
         const isError = part.output.type === 'error-text' || part.output.type === 'error-json';
         if (!isError) continue;
         const turnsAt = messages.slice(0, i).filter(m => m.role === 'user').length;
@@ -371,7 +429,8 @@ export default class DCPExtension implements Extension {
     // --- Feedback ---
     if (changed) {
       const total = counts.duplicate + counts.supersede + counts.error + counts.manual + counts.distill;
-      if (total > 0) {
+      const newlyPruned = this.seenToolCallIds.size - seenSizeBefore;
+      if (total > 0 && newlyPruned > 0) {
         const parts: string[] = [];
         if (counts.duplicate) parts.push(`${counts.duplicate} duplicate`);
         if (counts.supersede) parts.push(`${counts.supersede} supersede`);
@@ -380,7 +439,7 @@ export default class DCPExtension implements Extension {
         if (counts.distill) parts.push(`${counts.distill} distill`);
 
         const detail = parts.length > 0 ? ` (${parts.join(', ')})` : '';
-        const summary = `DCP: pruned ${total} output(s)${detail} — ~${this.stats.estimatedTokensSaved} tokens saved total`;
+        const summary = `DCP: pruned ${total} output(s)${detail} — ±${this.stats.estimatedTokensSaved} tokens saved total`;
 
         context.log(summary, 'info');
         const taskContext = context.getTaskContext();
@@ -460,7 +519,7 @@ export default class DCPExtension implements Extension {
           if (sub === 'stats') {
             const msg =
               `DCP Stats — ${this.stats.prunedParts} part(s) pruned total, ` +
-              `~${this.stats.estimatedTokensSaved} tokens saved, ` +
+              `±${this.stats.estimatedTokensSaved} tokens saved, ` +
               `${this.distilledRanges.length} active distillation range(s), ` +
               `${this.manuallyPrunedIds.size} message(s) marked for manual pruning`;
             extContext.log(msg, 'info');
@@ -492,7 +551,7 @@ export default class DCPExtension implements Extension {
           } else if (sub === 'context') {
             const msg =
               `DCP Context: ${this.stats.prunedParts} output(s) pruned, ` +
-              `~${this.stats.estimatedTokensSaved} tokens saved, ` +
+              `±${this.stats.estimatedTokensSaved} tokens saved, ` +
               `${this.distilledRanges.length} distillation range(s), ` +
               `${this.manuallyPrunedIds.size} pending manual prune(s)`;
             extContext.log(msg, 'info');
