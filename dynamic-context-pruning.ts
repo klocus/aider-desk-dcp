@@ -102,8 +102,8 @@ export default class DCPExtension implements Extension {
   static metadata = {
     name: 'Dynamic Context Pruning',
     version: '1.0.0',
-    description: 'Intelligently manages conversation context to optimize token usage',
-    author: 'AiderDesk Engineer',
+    description: 'Automatically manages conversation context to optimize token usage',
+    author: 'Paweł Klockiewicz',
     capabilities: ['tools', 'commands', 'events']
   };
 
