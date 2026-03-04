@@ -12,7 +12,7 @@ import type {
   ToolDefinition,
   ToolResultOutput,
   ToolResultPart
-} from './extension-types';
+} from '@aiderdesk/extensions';
 
 // --- Constants ---
 
