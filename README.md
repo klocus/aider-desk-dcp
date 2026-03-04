@@ -58,15 +58,13 @@ The agent is instructed to use these proactively when the context grows large or
 **Global (available in all projects)**
 
 ```sh
-curl -o ~/.aider-desk/extensions/dynamic-context-pruning.ts \
-  https://raw.githubusercontent.com/klocus/aider-desk-dcp/master/dynamic-context-pruning.ts
+npx @aiderdesk/extensions install https://raw.githubusercontent.com/klocus/aider-desk-dcp/refs/heads/master/dynamic-context-pruning.ts --global
 ```
 
 **Project-level**
 
 ```sh
-curl -o ./.aider-desk/extensions/dynamic-context-pruning.ts \
-  https://raw.githubusercontent.com/klocus/aider-desk-dcp/master/dynamic-context-pruning.ts
+npx @aiderdesk/extensions install https://raw.githubusercontent.com/klocus/aider-desk-dcp/refs/heads/master/dynamic-context-pruning.ts
 ```
 
 ## Usage
