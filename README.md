@@ -38,7 +38,6 @@ DCP reads its configuration from `dcp/config.json`. All settings are optional an
 ```json
 {
   "enabled": true,
-  "pruneNotification": "detailed",
   "manualMode": false,
   "protectedTools": [],
   "tools": {
@@ -60,7 +59,6 @@ DCP reads its configuration from `dcp/config.json`. All settings are optional an
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `enabled` | boolean | `true` | Master switch for the entire extension. |
-| `pruneNotification` | string | `"detailed"` | Verbosity of prune feedback: `"off"`, `"minimal"`, or `"detailed"`. |
 | `manualMode` | boolean | `false` | If `true`, disables automatic pruning and prunable-tools injection. Agent must manually call `dcp-prune` or `dcp-distill`. |
 | `protectedTools` | string[] | `[]` | Additional tool name patterns to never prune. Uses substring matching. |
 

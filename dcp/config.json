@@ -1,6 +1,5 @@
 {
   "enabled": true,
-  "pruneNotification": "detailed",
   "manualMode": false,
   "protectedTools": [],
   "tools": {

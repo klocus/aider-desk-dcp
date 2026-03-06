@@ -20,7 +20,6 @@ import { z } from 'zod';
 
 interface DcpConfig {
   enabled: boolean;
-  pruneNotification: 'off' | 'minimal' | 'detailed';
   manualMode: boolean;
   protectedTools: string[];
   tools: {
@@ -269,7 +268,7 @@ export default class DCPExtension implements Extension {
 
   async onLoad(context: ExtensionContext): Promise<void> {
     this.config = loadConfig();
-    context.log(`DCP Extension loaded (enabled=${this.config.enabled}, manual=${this.config.manualMode})`, 'info');
+    context.log(`🧹 DCP: Extension loaded (enabled=${this.config.enabled}, manual=${this.config.manualMode})`, 'info');
   }
 
   async onUnload(): Promise<void> {
@@ -411,7 +410,7 @@ export default class DCPExtension implements Extension {
     try {
       return this.runPruning(event, context);
     } catch (err) {
-      context.log(`DCP: Error during pruning — ${err}`, 'error');
+      context.log(`🧹 DCP: Error during pruning — ${err}`, 'error');
       return undefined;
     }
   }
@@ -635,7 +634,7 @@ export default class DCPExtension implements Extension {
     if (changed) {
       const total = counts.duplicate + counts.supersede + counts.error + counts.manual + counts.distill;
       const newlyPruned = this.seenToolCallIds.size - seenSizeBefore;
-      if (total > 0 && newlyPruned > 0 && this.config.pruneNotification !== 'off') {
+      if (total > 0 && newlyPruned > 0) {
         const parts: string[] = [];
         if (counts.duplicate) parts.push(`${counts.duplicate} duplicate`);
         if (counts.supersede) parts.push(`${counts.supersede} supersede`);
@@ -643,13 +642,8 @@ export default class DCPExtension implements Extension {
         if (counts.manual) parts.push(`${counts.manual} manual`);
         if (counts.distill) parts.push(`${counts.distill} distill`);
 
-        let summary: string;
-        if (this.config.pruneNotification === 'minimal') {
-          summary = `DCP: Pruned ${total} output(s) — ±${this.stats.estimatedTokensSaved} tokens saved`;
-        } else {
-          const detail = parts.length > 0 ? ` (${parts.join(', ')})` : '';
-          summary = `DCP: Pruned ${total} output(s)${detail} — ±${this.stats.estimatedTokensSaved} tokens saved total`;
-        }
+        const detail = parts.length > 0 ? ` (${parts.join(', ')})` : '';
+        const summary = `🧹 DCP: Pruned ${total} output(s)${detail} — ±${this.stats.estimatedTokensSaved} tokens saved total`;
 
         context.log(summary, 'info');
         const taskContext = context.getTaskContext();
@@ -679,12 +673,12 @@ export default class DCPExtension implements Extension {
         execute: async (input, _signal, extContext) => {
           const ids = (input.messageIds as string[]).filter(id => id && id !== 'undefined');
           if (ids.length === 0) {
-            const msg = 'DCP: No valid message IDs provided — nothing to prune';
+            const msg = '🧹 DCP: No valid message IDs provided — nothing to prune';
             extContext.log(msg, 'warn');
             return msg;
           }
           ids.forEach(id => this.manuallyPrunedIds.add(id));
-          const msg = `DCP: Marked ${ids.length} message(s) for pruning — will take effect on next request`;
+          const msg = `🧹 DCP: Marked ${ids.length} message(s) for pruning — will take effect on next request`;
           extContext.log(msg, 'info');
           const taskContext = extContext.getTaskContext();
           if (taskContext) taskContext.addLogMessage('info', msg);
@@ -714,7 +708,7 @@ export default class DCPExtension implements Extension {
             endId: range.endId,
             summary: input.summary as string
           });
-          const msg = `DCP: Range distilled — tool outputs will be pruned on next request. Summary: "${input.summary}"`;
+          const msg = `🧹 DCP: Range distilled — tool outputs will be pruned on next request. Summary: "${input.summary}"`;
           extContext.log(msg, 'info');
           const taskContext = extContext.getTaskContext();
           if (taskContext) taskContext.addLogMessage('info', msg);
@@ -740,7 +734,7 @@ export default class DCPExtension implements Extension {
 
           if (sub === 'stats') {
             const msg =
-              `DCP Stats: ${this.stats.prunedParts} part(s) pruned total, ` +
+              `🧹 DCP: Stats — ${this.stats.prunedParts} part(s) pruned total, ` +
               `±${this.stats.estimatedTokensSaved} tokens saved, ` +
               `${this.distilledRanges.length} active distillation range(s), ` +
               `${this.manuallyPrunedIds.size} message(s) marked for manual pruning`;
@@ -756,11 +750,11 @@ export default class DCPExtension implements Extension {
               }
               toolMessages.forEach(m => this.manuallyPrunedIds.add(m.id));
               const countLabel = count && count > 0 ? ` (last ${count})` : '';
-              const msg = `DCP Sweep: Marked ${toolMessages.length} tool message(s)${countLabel} for pruning — will take effect on next request`;
+              const msg = `🧹 DCP Sweep: Marked ${toolMessages.length} tool message(s)${countLabel} for pruning — will take effect on next request`;
               extContext.log(msg, 'info');
               taskContext.addLogMessage('info', msg);
             } else {
-              extContext.log('DCP Sweep: No active task', 'warn');
+              extContext.log('🧹 DCP Sweep: No active task', 'warn');
             }
           } else if (sub === 'reset') {
             this.stats = { prunedParts: 0, estimatedTokensSaved: 0 };
@@ -769,15 +763,15 @@ export default class DCPExtension implements Extension {
             this.distilledRanges = [];
             this.lastToolWasDcp = false;
             this.nudgeCounter = 0;
-            const msg = 'DCP: State reset — all stats, prune marks, and distillation ranges cleared';
+            const msg = '🧹 DCP: State reset — all stats, prune marks, and distillation ranges cleared';
             extContext.log(msg, 'info');
             if (taskContext) taskContext.addLogMessage('info', msg);
           } else if (!sub) {
-            const msg = 'DCP commands: /dcp stats | /dcp sweep [count] | /dcp reset';
+            const msg = '🧹 DCP: commands — /dcp stats | /dcp sweep [count] | /dcp reset';
             extContext.log(msg, 'info');
             if (taskContext) taskContext.addLogMessage('info', msg);
           } else {
-            const help = `DCP: Unknown subcommand "${sub}". Available: stats, sweep, reset`;
+            const help = `🧹 DCP: Unknown subcommand "${sub}". Available: stats, sweep, reset`;
             extContext.log(help, 'warn');
             if (taskContext) taskContext.addLogMessage('warning', help);
           }
