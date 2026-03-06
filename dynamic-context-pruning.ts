@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import type {
   AgentProfile,
   AgentStartedEvent,
@@ -13,10 +12,11 @@ import type {
   ToolResultOutput,
   ToolResultPart
 } from '@aiderdesk/extensions';
+import { z } from 'zod';
 
 // --- Constants ---
 
-const PRUNED_ERROR_INPUT = '[DCP: input removed — failed tool call]';
+const PRUNED_ERROR_INPUT = '[DCP: Input removed — failed tool call]';
 
 /**
  * Tools whose outputs should never be pruned (blacklist approach).
@@ -41,18 +41,53 @@ const PROTECTED_TOOL_PATTERNS = [
   'drop_context_files'
 ];
 
-function isProtectedTool(name: string): boolean {
-  return PROTECTED_TOOL_PATTERNS.some(p => name === p || name.includes(p));
-}
+const DCP_SYSTEM_PROMPT = `
+<system-reminder>
+<instruction name=context_management_protocol policy_level=critical>
+You operate a context-constrained environment and MUST PROACTIVELY MANAGE IT TO AVOID CONTEXT ROT. Efficient context management is CRITICAL to maintaining performance and ensuring successful task completion.
 
-const DCP_SYSTEM_HINT = [
-  '',
-  '## Context Management (DCP)',
-  'You have context management tools available:',
-  '- **dcp-prune** — Mark specific tool messages for pruning to free context space.',
-  '- **dcp-distill** — Summarize findings from a message range, then prune all tool outputs in that range.',
-  'Use these proactively when context grows large or after completing a research/exploration phase.'
-].join('\n');
+AVAILABLE TOOLS FOR CONTEXT MANAGEMENT
+\`dcp-distill\`: condense key findings from tool calls into high-fidelity distillation to preserve gained insights. Use to extract valuable knowledge to the user's request. BE THOROUGH, your distillation MUST be high-signal, low noise and complete.
+\`dcp-prune\`: remove individual tool calls that are noise, irrelevant, or superseded. No preservation of content. DO NOT let irrelevant tool calls accumulate. DO NOT PRUNE TOOL OUTPUTS THAT YOU MAY NEED LATER.
+
+THE DISTILL TOOL
+\`dcp-distill\` is the favored way to target specific tools and crystalize their value into high-signal low-noise knowledge nuggets. Your distillation must be comprehensive, capturing technical details (symbols, signatures, logic, constraints) such that the raw output is no longer needed. THINK complete technical substitute. \`dcp-distill\` is typically best used when you are certain the raw information is not needed anymore, but the knowledge it contains is valuable to retain so you maintain context authenticity and understanding. Be conservative in your approach to distilling, but do NOT hesitate to distill when appropriate.
+
+THE PRUNE TOOL
+\`dcp-prune\` is your last resort for context management. It is a blunt instrument that removes tool outputs entirely, without ANY preservation. It is best used to eliminate noise, irrelevant information, or superseded outputs that no longer add value to the conversation. You MUST NOT prune tool outputs that you may need later. Prune is a targeted nuke, not a general cleanup tool. Contemplate only pruning when you are certain that the tool output is irrelevant to the current task or has been superseded by more recent information. If in doubt, defer until you are definitive.
+
+TIMING
+Prefer managing context at the START of a new agentic loop (after receiving a user message) rather than at the END of your previous turn. At turn start, you have fresh signal about what the user needs next - you can better judge what's still relevant versus noise from prior work. Managing at turn end means making retention decisions before knowing what comes next.
+
+EVALUATE YOUR CONTEXT AND MANAGE REGULARLY TO AVOID CONTEXT ROT. AVOID USING MANAGEMENT TOOLS AS THE ONLY TOOL CALLS IN YOUR RESPONSE, PARALLELIZE WITH OTHER RELEVANT TOOLS TO TASK CONTINUATION. It is imperative you understand the value or lack thereof of the context you manage and make informed decisions to maintain a decluttered, high-quality and relevant context.
+
+The session is your responsibility, and effective context management is CRITICAL to your success. Be PROACTIVE, DELIBERATE, and STRATEGIC in your approach to context management. Keep it clean, relevant, and high-quality to ensure optimal performance and successful task completion.
+
+Be respectful of the user's API usage, manage context methodically as you work through the task and avoid calling ONLY context management tools in your responses.
+</instruction>
+
+<instruction name=injected_context_handling policy_level=critical>
+This chat environment injects context information on your behalf in the form of a <prunable-tools> list to help you manage context effectively. Carefully read the list and use it to inform your management decisions. The list is automatically updated after each turn to reflect the current state of manageable tools and context usage. If no list is present, do NOT attempt to prune anything.
+There may be tools in session context that do not appear in the <prunable-tools> list — this is expected. You can ONLY prune what you see in the list.
+</instruction>
+</system-reminder>
+`.trim();
+
+const DCP_NUDGE = `
+<instruction name=context_management_required>
+CRITICAL CONTEXT WARNING
+Your context window is filling with tool outputs. Strict adherence to context hygiene is required.
+
+PROTOCOL
+You should prioritize context management, but do not interrupt a critical atomic operation if one is in progress. Once the immediate step is done, you must perform context management.
+
+IMMEDIATE ACTION REQUIRED
+KNOWLEDGE PRESERVATION: If holding valuable raw data you POTENTIALLY will need in your task, use the \`dcp-distill\` tool. Produce a high-fidelity distillation to preserve insights - be thorough.
+NOISE REMOVAL: If you read files or ran commands that yielded no value, use the \`dcp-prune\` tool to remove them. If newer tools supersede older ones, prune the old.
+</instruction>
+`.trim();
+
+const DCP_COOLDOWN = `<context-info>Context management was just performed. Do NOT use dcp-prune or dcp-distill again this turn. A fresh prunable-tools list will be available after your next tool use.</context-info>`;
 
 // --- Helpers ---
 
@@ -84,6 +119,10 @@ function normalizeForSignature(val: unknown): unknown {
 function toolSignature(toolName: string, input: unknown): string {
   if (input === undefined) return toolName;
   return `${toolName}::${JSON.stringify(normalizeForSignature(input))}`;
+}
+
+function isProtectedTool(name: string): boolean {
+  return PROTECTED_TOOL_PATTERNS.some(p => name === p || name.includes(p));
 }
 
 /** Detects tools that modify file contents or produce non-idempotent output */
@@ -166,6 +205,9 @@ export default class DCPExtension implements Extension {
   private seenToolCallIds = new Set<string>();
   private manuallyPrunedIds = new Set<string>();
   private distilledRanges: DistilledRange[] = [];
+  private lastToolWasDcp = false;
+  private nudgeCounter = 0;
+  private readonly NUDGE_FREQUENCY = 5; // nudge every N tool messages
 
   async onLoad(context: ExtensionContext): Promise<void> {
     context.log('DCP Extension loaded', 'info');
@@ -176,6 +218,8 @@ export default class DCPExtension implements Extension {
     this.seenToolCallIds.clear();
     this.manuallyPrunedIds.clear();
     this.distilledRanges = [];
+    this.lastToolWasDcp = false;
+    this.nudgeCounter = 0;
   }
 
   // --- Internal helpers ---
@@ -210,15 +254,87 @@ export default class DCPExtension implements Extension {
     return { msg: count > 0 ? { ...msg, content: newContent } : msg, count };
   }
 
+  /** Build <prunable-tools> context listing tool messages available for pruning/distilling. */
+  private buildPrunableToolsContext(messages: ContextMessage[], toolCalls: Map<string, ToolCallRef>): string | null {
+    // Check if the last assistant response used DCP tools — if so, inject cooldown
+    const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant');
+    if (lastAssistant && Array.isArray(lastAssistant.content)) {
+      const parts = lastAssistant.content as { type: string; toolName?: string }[];
+      const hasDcpTool = parts.some(
+        p => p.type === 'tool-call' && (p.toolName === 'dcp-prune' || p.toolName === 'dcp-distill')
+      );
+      if (hasDcpTool) {
+        this.lastToolWasDcp = true;
+        return DCP_COOLDOWN;
+      }
+    }
+
+    if (this.lastToolWasDcp) {
+      this.lastToolWasDcp = false;
+    }
+
+    const lines: string[] = [];
+    let firstMsgId: string | null = null;
+    let lastMsgId: string | null = null;
+
+    for (const msg of messages) {
+      if (msg.role !== 'tool') continue;
+      const toolMsg = msg as ContextToolMessage;
+
+      for (const part of toolMsg.content) {
+        // Skip already pruned
+        if (part.output.type === 'text' && part.output.value.startsWith('[DCP:')) continue;
+        // Skip protected
+        if (isProtectedTool(part.toolName)) continue;
+
+        const size = outputSize(part.output);
+        if (size < 50) continue; // too small to matter
+
+        const ref = toolCalls.get(part.toolCallId);
+        const filePath = extractPath(ref?.input as Record<string, unknown> | undefined);
+        const description = filePath ? `${part.toolName}, ${filePath}` : part.toolName;
+        const tokenEstimate = Math.ceil(size / 4);
+
+        lines.push(`${msg.id}: ${description} (~${tokenEstimate} tokens)`);
+
+        if (!firstMsgId) firstMsgId = msg.id;
+        lastMsgId = msg.id;
+      }
+    }
+
+    if (lines.length === 0) return null;
+
+    this.nudgeCounter++;
+    const needsNudge = this.nudgeCounter >= this.NUDGE_FREQUENCY;
+    if (needsNudge) this.nudgeCounter = 0;
+
+    const parts: string[] = [];
+
+    parts.push(
+      `<prunable-tools>\nThe following tool messages are available for pruning/distilling. Use their IDs with dcp-prune (messageIds) or dcp-distill (range startId/endId).\n${lines.join('\n')}\n</prunable-tools>`
+    );
+
+    if (firstMsgId && lastMsgId && firstMsgId !== lastMsgId) {
+      parts.push(`<distill-range>Available range: startId="${firstMsgId}" endId="${lastMsgId}"</distill-range>`);
+    }
+
+    if (needsNudge) {
+      parts.push(DCP_NUDGE);
+    }
+
+    return parts.join('\n');
+  }
+
   // --- Hooks ---
 
-  /** Inject DCP system prompt hint when agent starts */
+  /** Inject DCP instructions into the system prompt before each agent session. */
   async onAgentStarted(
     event: AgentStartedEvent,
     _context: ExtensionContext
   ): Promise<void | Partial<AgentStartedEvent>> {
-    const current = event.systemPrompt ?? '';
-    return { systemPrompt: current + DCP_SYSTEM_HINT };
+    const existing = event.systemPrompt ?? '';
+    const separator = existing ? '\n\n' : '';
+    return { systemPrompt: existing + separator + DCP_SYSTEM_PROMPT };
   }
 
   /** Main pruning pass — runs before every LLM call */
@@ -426,6 +542,20 @@ export default class DCPExtension implements Extension {
       }
     }
 
+    // --- Phase 6: Inject prunable-tools context ---
+    const prunableContext = this.buildPrunableToolsContext(messages, toolCalls);
+    if (prunableContext) {
+      // Find the last user message and append the prunable-tools context
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+          const userMsg = messages[i] as ContextMessage & { role: 'user'; content: string };
+          messages[i] = { ...userMsg, content: userMsg.content + '\n\n' + prunableContext };
+          changed = true;
+          break;
+        }
+      }
+    }
+
     // --- Feedback ---
     if (changed) {
       const total = counts.duplicate + counts.supersede + counts.error + counts.manual + counts.distill;
@@ -439,7 +569,7 @@ export default class DCPExtension implements Extension {
         if (counts.distill) parts.push(`${counts.distill} distill`);
 
         const detail = parts.length > 0 ? ` (${parts.join(', ')})` : '';
-        const summary = `DCP: pruned ${total} output(s)${detail} — ±${this.stats.estimatedTokensSaved} tokens saved total`;
+        const summary = `DCP: Pruned ${total} output(s)${detail} — ±${this.stats.estimatedTokensSaved} tokens saved total`;
 
         context.log(summary, 'info');
         const taskContext = context.getTaskContext();
@@ -545,6 +675,8 @@ export default class DCPExtension implements Extension {
             this.seenToolCallIds.clear();
             this.manuallyPrunedIds.clear();
             this.distilledRanges = [];
+            this.lastToolWasDcp = false;
+            this.nudgeCounter = 0;
             const msg = 'DCP: State reset — all stats, prune marks, and distillation ranges cleared';
             extContext.log(msg, 'info');
             if (taskContext) taskContext.addLogMessage('info', msg);
