@@ -12,7 +12,35 @@ import type {
   ToolResultOutput,
   ToolResultPart
 } from '@aiderdesk/extensions';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { z } from 'zod';
+
+// --- Config ---
+
+interface DcpConfig {
+  enabled: boolean;
+  pruneNotification: 'off' | 'minimal' | 'detailed';
+  manualMode: boolean;
+  protectedTools: string[];
+  tools: {
+    nudgeEnabled: boolean;
+    nudgeFrequency: number;
+    distill: boolean;
+    prune: boolean;
+  };
+  strategies: {
+    deduplication: { enabled: boolean };
+    supersedeWrites: { enabled: boolean };
+    purgeErrors: { enabled: boolean; turns: number };
+  };
+}
+
+function loadConfig(): DcpConfig {
+  const configPath = join(__dirname, 'config.json');
+  const raw = readFileSync(configPath, 'utf-8');
+  return JSON.parse(raw) as DcpConfig;
+}
 
 // --- Constants ---
 
@@ -41,20 +69,37 @@ const PROTECTED_TOOL_PATTERNS = [
   'drop_context_files'
 ];
 
-const DCP_SYSTEM_PROMPT = `
-<system-reminder>
+function buildSystemPrompt(distillEnabled: boolean, pruneEnabled: boolean): string {
+  const toolList: string[] = [];
+  if (distillEnabled)
+    toolList.push(
+      "`dcp-distill`: condense key findings from tool calls into high-fidelity distillation to preserve gained insights. Use to extract valuable knowledge to the user's request. BE THOROUGH, your distillation MUST be high-signal, low noise and complete."
+    );
+  if (pruneEnabled)
+    toolList.push(
+      '`dcp-prune`: remove individual tool calls that are noise, irrelevant, or superseded. No preservation of content. DO NOT let irrelevant tool calls accumulate. DO NOT PRUNE TOOL OUTPUTS THAT YOU MAY NEED LATER.'
+    );
+
+  const distillSection = distillEnabled
+    ? `
+
+THE DISTILL TOOL
+\`dcp-distill\` is the favored way to target specific tools and crystalize their value into high-signal low-noise knowledge nuggets. Your distillation must be comprehensive, capturing technical details (symbols, signatures, logic, constraints) such that the raw output is no longer needed. THINK complete technical substitute. \`dcp-distill\` is typically best used when you are certain the raw information is not needed anymore, but the knowledge it contains is valuable to retain so you maintain context authenticity and understanding. Be conservative in your approach to distilling, but do NOT hesitate to distill when appropriate.`
+    : '';
+
+  const pruneSection = pruneEnabled
+    ? `
+
+THE PRUNE TOOL
+\`dcp-prune\` is your last resort for context management. It is a blunt instrument that removes tool outputs entirely, without ANY preservation. It is best used to eliminate noise, irrelevant information, or superseded outputs that no longer add value to the conversation. You MUST NOT prune tool outputs that you may need later. Prune is a targeted nuke, not a general cleanup tool. Contemplate only pruning when you are certain that the tool output is irrelevant to the current task or has been superseded by more recent information. If in doubt, defer until you are definitive.`
+    : '';
+
+  return `<system-reminder>
 <instruction name=context_management_protocol policy_level=critical>
 You operate a context-constrained environment and MUST PROACTIVELY MANAGE IT TO AVOID CONTEXT ROT. Efficient context management is CRITICAL to maintaining performance and ensuring successful task completion.
 
 AVAILABLE TOOLS FOR CONTEXT MANAGEMENT
-\`dcp-distill\`: condense key findings from tool calls into high-fidelity distillation to preserve gained insights. Use to extract valuable knowledge to the user's request. BE THOROUGH, your distillation MUST be high-signal, low noise and complete.
-\`dcp-prune\`: remove individual tool calls that are noise, irrelevant, or superseded. No preservation of content. DO NOT let irrelevant tool calls accumulate. DO NOT PRUNE TOOL OUTPUTS THAT YOU MAY NEED LATER.
-
-THE DISTILL TOOL
-\`dcp-distill\` is the favored way to target specific tools and crystalize their value into high-signal low-noise knowledge nuggets. Your distillation must be comprehensive, capturing technical details (symbols, signatures, logic, constraints) such that the raw output is no longer needed. THINK complete technical substitute. \`dcp-distill\` is typically best used when you are certain the raw information is not needed anymore, but the knowledge it contains is valuable to retain so you maintain context authenticity and understanding. Be conservative in your approach to distilling, but do NOT hesitate to distill when appropriate.
-
-THE PRUNE TOOL
-\`dcp-prune\` is your last resort for context management. It is a blunt instrument that removes tool outputs entirely, without ANY preservation. It is best used to eliminate noise, irrelevant information, or superseded outputs that no longer add value to the conversation. You MUST NOT prune tool outputs that you may need later. Prune is a targeted nuke, not a general cleanup tool. Contemplate only pruning when you are certain that the tool output is irrelevant to the current task or has been superseded by more recent information. If in doubt, defer until you are definitive.
+${toolList.join('\n')}${distillSection}${pruneSection}
 
 TIMING
 Prefer managing context at the START of a new agentic loop (after receiving a user message) rather than at the END of your previous turn. At turn start, you have fresh signal about what the user needs next - you can better judge what's still relevant versus noise from prior work. Managing at turn end means making retention decisions before knowing what comes next.
@@ -70,11 +115,20 @@ Be respectful of the user's API usage, manage context methodically as you work t
 This chat environment injects context information on your behalf in the form of a <prunable-tools> list to help you manage context effectively. Carefully read the list and use it to inform your management decisions. The list is automatically updated after each turn to reflect the current state of manageable tools and context usage. If no list is present, do NOT attempt to prune anything.
 There may be tools in session context that do not appear in the <prunable-tools> list — this is expected. You can ONLY prune what you see in the list.
 </instruction>
-</system-reminder>
-`.trim();
+</system-reminder>`.trim();
+}
 
-const DCP_NUDGE = `
-<instruction name=context_management_required>
+function buildNudge(distillEnabled: boolean, pruneEnabled: boolean): string {
+  const actions: string[] = [];
+  if (distillEnabled)
+    actions.push(
+      'KNOWLEDGE PRESERVATION: If holding valuable raw data you POTENTIALLY will need in your task, use the `dcp-distill` tool. Produce a high-fidelity distillation to preserve insights - be thorough.'
+    );
+  if (pruneEnabled)
+    actions.push(
+      'NOISE REMOVAL: If you read files or ran commands that yielded no value, use the `dcp-prune` tool to remove them. If newer tools supersede older ones, prune the old.'
+    );
+  return `<instruction name=context_management_required>
 CRITICAL CONTEXT WARNING
 Your context window is filling with tool outputs. Strict adherence to context hygiene is required.
 
@@ -82,12 +136,14 @@ PROTOCOL
 You should prioritize context management, but do not interrupt a critical atomic operation if one is in progress. Once the immediate step is done, you must perform context management.
 
 IMMEDIATE ACTION REQUIRED
-KNOWLEDGE PRESERVATION: If holding valuable raw data you POTENTIALLY will need in your task, use the \`dcp-distill\` tool. Produce a high-fidelity distillation to preserve insights - be thorough.
-NOISE REMOVAL: If you read files or ran commands that yielded no value, use the \`dcp-prune\` tool to remove them. If newer tools supersede older ones, prune the old.
-</instruction>
-`.trim();
+${actions.join('\n')}
+</instruction>`.trim();
+}
 
-const DCP_COOLDOWN = `<context-info>Context management was just performed. Do NOT use dcp-prune or dcp-distill again this turn. A fresh prunable-tools list will be available after your next tool use.</context-info>`;
+function buildCooldown(distillEnabled: boolean, pruneEnabled: boolean): string {
+  const tools = [distillEnabled && 'dcp-distill', pruneEnabled && 'dcp-prune'].filter(Boolean).join(' or ');
+  return `<context-info>Context management was just performed. Do NOT use ${tools} again this turn. A fresh prunable-tools list will be available after your next tool use.</context-info>`;
+}
 
 // --- Helpers ---
 
@@ -119,10 +175,6 @@ function normalizeForSignature(val: unknown): unknown {
 function toolSignature(toolName: string, input: unknown): string {
   if (input === undefined) return toolName;
   return `${toolName}::${JSON.stringify(normalizeForSignature(input))}`;
-}
-
-function isProtectedTool(name: string): boolean {
-  return PROTECTED_TOOL_PATTERNS.some(p => name === p || name.includes(p));
 }
 
 /** Detects tools that modify file contents or produce non-idempotent output */
@@ -195,7 +247,7 @@ function extractPath(input: Record<string, unknown> | undefined): string | undef
 export default class DCPExtension implements Extension {
   static metadata = {
     name: 'Dynamic Context Pruning',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'Automatically manages conversation context to optimize token usage',
     author: 'Paweł Klockiewicz',
     capabilities: ['tools', 'commands', 'events']
@@ -207,10 +259,17 @@ export default class DCPExtension implements Extension {
   private distilledRanges: DistilledRange[] = [];
   private lastToolWasDcp = false;
   private nudgeCounter = 0;
-  private readonly NUDGE_FREQUENCY = 5; // nudge every N tool messages
+  private config!: DcpConfig;
+
+  /** Check if a tool should be protected from pruning based on patterns + config list */
+  private isProtectedTool(name: string): boolean {
+    const all = [...PROTECTED_TOOL_PATTERNS, ...this.config.protectedTools];
+    return all.some(p => name === p || name.includes(p));
+  }
 
   async onLoad(context: ExtensionContext): Promise<void> {
-    context.log('DCP Extension loaded', 'info');
+    this.config = loadConfig();
+    context.log(`DCP Extension loaded (enabled=${this.config.enabled}, manual=${this.config.manualMode})`, 'info');
   }
 
   async onUnload(): Promise<void> {
@@ -246,7 +305,7 @@ export default class DCPExtension implements Extension {
   private pruneToolMessage(msg: ContextToolMessage, reason: string): { msg: ContextToolMessage; count: number } {
     let count = 0;
     const newContent = msg.content.map(part => {
-      if (isProtectedTool(part.toolName)) return part;
+      if (this.isProtectedTool(part.toolName)) return part;
       const pruned = this.prunePart(part, reason);
       if (pruned !== part) count++;
       return pruned;
@@ -265,7 +324,7 @@ export default class DCPExtension implements Extension {
       );
       if (hasDcpTool) {
         this.lastToolWasDcp = true;
-        return DCP_COOLDOWN;
+        return buildCooldown(this.config.tools.distill, this.config.tools.prune);
       }
     }
 
@@ -279,13 +338,15 @@ export default class DCPExtension implements Extension {
 
     for (const msg of messages) {
       if (msg.role !== 'tool') continue;
+      // Skip messages without a valid id — prevents "undefined" leaking to the agent
+      if (!msg.id) continue;
       const toolMsg = msg as ContextToolMessage;
 
       for (const part of toolMsg.content) {
         // Skip already pruned
         if (part.output.type === 'text' && part.output.value.startsWith('[DCP:')) continue;
         // Skip protected
-        if (isProtectedTool(part.toolName)) continue;
+        if (this.isProtectedTool(part.toolName)) continue;
 
         const size = outputSize(part.output);
         if (size < 50) continue; // too small to matter
@@ -305,7 +366,8 @@ export default class DCPExtension implements Extension {
     if (lines.length === 0) return null;
 
     this.nudgeCounter++;
-    const needsNudge = this.nudgeCounter >= this.NUDGE_FREQUENCY;
+    const nudgeEnabled = this.config.tools.nudgeEnabled && !this.config.manualMode;
+    const needsNudge = nudgeEnabled && this.nudgeCounter >= this.config.tools.nudgeFrequency;
     if (needsNudge) this.nudgeCounter = 0;
 
     const parts: string[] = [];
@@ -319,7 +381,7 @@ export default class DCPExtension implements Extension {
     }
 
     if (needsNudge) {
-      parts.push(DCP_NUDGE);
+      parts.push(buildNudge(this.config.tools.distill, this.config.tools.prune));
     }
 
     return parts.join('\n');
@@ -332,9 +394,12 @@ export default class DCPExtension implements Extension {
     event: AgentStartedEvent,
     _context: ExtensionContext
   ): Promise<void | Partial<AgentStartedEvent>> {
+    const distillEnabled = this.config.tools.distill;
+    const pruneEnabled = this.config.tools.prune;
+    if (!this.config.enabled || this.config.manualMode || (!distillEnabled && !pruneEnabled)) return;
     const existing = event.systemPrompt ?? '';
     const separator = existing ? '\n\n' : '';
-    return { systemPrompt: existing + separator + DCP_SYSTEM_PROMPT };
+    return { systemPrompt: existing + separator + buildSystemPrompt(distillEnabled, pruneEnabled) };
   }
 
   /** Main pruning pass — runs before every LLM call */
@@ -342,6 +407,7 @@ export default class DCPExtension implements Extension {
     event: OptimizeMessagesEvent,
     context: ExtensionContext
   ): Promise<void | Partial<OptimizeMessagesEvent>> {
+    if (!this.config.enabled) return;
     try {
       return this.runPruning(event, context);
     } catch (err) {
@@ -409,158 +475,167 @@ export default class DCPExtension implements Extension {
     }
 
     // --- Phase 3: Deduplication — keep only the latest occurrence of identical tool calls ---
-    const sigRegistry = new Map<string, { msgIndex: number; partIndex: number }>();
-    for (let i = 0; i < messages.length; i++) {
-      if (messages[i].role !== 'tool') continue;
-      const toolMsg = messages[i] as ContextToolMessage;
-      for (let j = 0; j < toolMsg.content.length; j++) {
-        const part = toolMsg.content[j];
-        if (part.output.type === 'text' && part.output.value.startsWith('[DCP:')) continue;
-        if (isProtectedTool(part.toolName)) continue;
-        // Don't dedup write/edit tools — same params doesn't mean same result (file may have changed)
-        if (isWriteTool(part.toolName)) continue;
+    if (this.config.strategies.deduplication.enabled) {
+      const sigRegistry = new Map<string, { msgIndex: number; partIndex: number }>();
+      for (let i = 0; i < messages.length; i++) {
+        if (messages[i].role !== 'tool') continue;
+        const toolMsg = messages[i] as ContextToolMessage;
+        for (let j = 0; j < toolMsg.content.length; j++) {
+          const part = toolMsg.content[j];
+          if (part.output.type === 'text' && part.output.value.startsWith('[DCP:')) continue;
+          if (this.isProtectedTool(part.toolName)) continue;
+          // Don't dedup write/edit tools — same params doesn't mean same result (file may have changed)
+          if (isWriteTool(part.toolName)) continue;
 
-        const ref = toolCalls.get(part.toolCallId);
-        const sig = toolSignature(part.toolName, ref?.input);
-        const prev = sigRegistry.get(sig);
+          const ref = toolCalls.get(part.toolCallId);
+          const sig = toolSignature(part.toolName, ref?.input);
+          const prev = sigRegistry.get(sig);
 
-        if (prev) {
-          const prevMsg = messages[prev.msgIndex] as ContextToolMessage;
-          const prevPart = prevMsg.content[prev.partIndex];
-          if (!(prevPart.output.type === 'text' && prevPart.output.value.startsWith('[DCP:'))) {
-            const prunedPart = this.prunePart(prevPart, 'superseded by later identical call');
-            if (prunedPart !== prevPart) {
-              const newContent = [...prevMsg.content];
-              newContent[prev.partIndex] = prunedPart;
-              messages[prev.msgIndex] = { ...prevMsg, content: newContent };
-              counts.duplicate++;
-              changed = true;
+          if (prev) {
+            const prevMsg = messages[prev.msgIndex] as ContextToolMessage;
+            const prevPart = prevMsg.content[prev.partIndex];
+            if (!(prevPart.output.type === 'text' && prevPart.output.value.startsWith('[DCP:'))) {
+              const prunedPart = this.prunePart(prevPart, 'superseded by later identical call');
+              if (prunedPart !== prevPart) {
+                const newContent = [...prevMsg.content];
+                newContent[prev.partIndex] = prunedPart;
+                messages[prev.msgIndex] = { ...prevMsg, content: newContent };
+                counts.duplicate++;
+                changed = true;
+              }
             }
           }
+          sigRegistry.set(sig, { msgIndex: i, partIndex: j });
         }
-        sigRegistry.set(sig, { msgIndex: i, partIndex: j });
       }
-    }
+    } // end deduplication
 
     // --- Phase 4: Supersede writes — prune earlier writes when file was later read ---
-    const fileWrites = new Map<string, { msgIndex: number; partIndex: number }>();
-    for (let i = 0; i < messages.length; i++) {
-      if (messages[i].role !== 'tool') continue;
-      const toolMsg = messages[i] as ContextToolMessage;
-      for (let j = 0; j < toolMsg.content.length; j++) {
-        const part = toolMsg.content[j];
-        if (part.output.type === 'text' && part.output.value.startsWith('[DCP:')) continue;
+    if (this.config.strategies.supersedeWrites.enabled) {
+      const fileWrites = new Map<string, { msgIndex: number; partIndex: number }>();
+      for (let i = 0; i < messages.length; i++) {
+        if (messages[i].role !== 'tool') continue;
+        const toolMsg = messages[i] as ContextToolMessage;
+        for (let j = 0; j < toolMsg.content.length; j++) {
+          const part = toolMsg.content[j];
+          if (part.output.type === 'text' && part.output.value.startsWith('[DCP:')) continue;
 
-        const ref = toolCalls.get(part.toolCallId);
-        const filePath = extractPath(ref?.input as Record<string, unknown> | undefined);
-        if (!filePath) continue;
+          const ref = toolCalls.get(part.toolCallId);
+          const filePath = extractPath(ref?.input as Record<string, unknown> | undefined);
+          if (!filePath) continue;
 
-        if (isWriteTool(part.toolName)) {
-          fileWrites.set(filePath, { msgIndex: i, partIndex: j });
-        } else if (isReadTool(part.toolName) && fileWrites.has(filePath)) {
-          const prev = fileWrites.get(filePath)!;
-          const prevMsg = messages[prev.msgIndex] as ContextToolMessage;
-          const prevPart = prevMsg.content[prev.partIndex];
-          if (!(prevPart.output.type === 'text' && prevPart.output.value.startsWith('[DCP:'))) {
-            const prunedPart = this.prunePart(prevPart, 'write superseded by later read');
-            if (prunedPart !== prevPart) {
-              const newContent = [...prevMsg.content];
-              newContent[prev.partIndex] = prunedPart;
-              messages[prev.msgIndex] = { ...prevMsg, content: newContent };
-              counts.supersede++;
-              changed = true;
+          if (isWriteTool(part.toolName)) {
+            fileWrites.set(filePath, { msgIndex: i, partIndex: j });
+          } else if (isReadTool(part.toolName) && fileWrites.has(filePath)) {
+            const prev = fileWrites.get(filePath)!;
+            const prevMsg = messages[prev.msgIndex] as ContextToolMessage;
+            const prevPart = prevMsg.content[prev.partIndex];
+            if (!(prevPart.output.type === 'text' && prevPart.output.value.startsWith('[DCP:'))) {
+              const prunedPart = this.prunePart(prevPart, 'write superseded by later read');
+              if (prunedPart !== prevPart) {
+                const newContent = [...prevMsg.content];
+                newContent[prev.partIndex] = prunedPart;
+                messages[prev.msgIndex] = { ...prevMsg, content: newContent };
+                counts.supersede++;
+                changed = true;
+              }
             }
+            fileWrites.delete(filePath);
           }
-          fileWrites.delete(filePath);
         }
       }
-    }
+    } // end supersedeWrites
 
     // --- Phase 5: Purge error inputs — prune large string inputs from assistant messages for errored tool calls ---
-    const userTurnsTotal = messages.filter(m => m.role === 'user').length;
-    const erroredIds = new Set<string>();
+    if (this.config.strategies.purgeErrors.enabled) {
+      const purgeErrorTurns = this.config.strategies.purgeErrors.turns;
+      const userTurnsTotal = messages.filter(m => m.role === 'user').length;
+      const erroredIds = new Set<string>();
 
-    for (let i = 0; i < messages.length; i++) {
-      if (messages[i].role !== 'tool') continue;
-      const toolMsg = messages[i] as ContextToolMessage;
-      for (const part of toolMsg.content) {
-        if (isProtectedTool(part.toolName)) continue;
-        const isError = part.output.type === 'error-text' || part.output.type === 'error-json';
-        if (!isError) continue;
-        const turnsAt = messages.slice(0, i).filter(m => m.role === 'user').length;
-        if (userTurnsTotal - turnsAt >= 4) {
-          erroredIds.add(part.toolCallId);
-        }
-      }
-    }
-
-    if (erroredIds.size > 0) {
       for (let i = 0; i < messages.length; i++) {
-        const msg = messages[i];
-        if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+        if (messages[i].role !== 'tool') continue;
+        const toolMsg = messages[i] as ContextToolMessage;
+        for (const part of toolMsg.content) {
+          if (this.isProtectedTool(part.toolName)) continue;
+          const isError = part.output.type === 'error-text' || part.output.type === 'error-json';
+          if (!isError) continue;
+          const turnsAt = messages.slice(0, i).filter(m => m.role === 'user').length;
+          if (userTurnsTotal - turnsAt >= purgeErrorTurns) {
+            erroredIds.add(part.toolCallId);
+          }
+        }
+      }
 
-        const asstMsg = msg as ContextAssistantMessage;
-        let msgModified = false;
-        const contentArr = asstMsg.content as unknown as { type: string; toolCallId?: string; input?: unknown }[];
-        const newContent = contentArr.map(part => {
-          if (part.type !== 'tool-call' || !erroredIds.has(part.toolCallId as string)) return part;
+      if (erroredIds.size > 0) {
+        for (let i = 0; i < messages.length; i++) {
+          const msg = messages[i];
+          if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
 
-          const input = part.input;
-          if (!input || typeof input !== 'object') return part;
+          const asstMsg = msg as ContextAssistantMessage;
+          let msgModified = false;
+          const contentArr = asstMsg.content as unknown as { type: string; toolCallId?: string; input?: unknown }[];
+          const newContent = contentArr.map(part => {
+            if (part.type !== 'tool-call' || !erroredIds.has(part.toolCallId as string)) return part;
 
-          let inputModified = false;
-          const prunedInput: Record<string, unknown> = {};
-          for (const [key, val] of Object.entries(input as Record<string, unknown>)) {
-            if (typeof val === 'string' && val.length > 100) {
-              prunedInput[key] = PRUNED_ERROR_INPUT;
-              inputModified = true;
-            } else {
-              prunedInput[key] = val;
+            const input = part.input;
+            if (!input || typeof input !== 'object') return part;
+
+            let inputModified = false;
+            const prunedInput: Record<string, unknown> = {};
+            for (const [key, val] of Object.entries(input as Record<string, unknown>)) {
+              if (typeof val === 'string' && val.length > 100) {
+                prunedInput[key] = PRUNED_ERROR_INPUT;
+                inputModified = true;
+              } else {
+                prunedInput[key] = val;
+              }
             }
+            if (!inputModified) return part;
+
+            // Count stats only once per tool call
+            const countKey = `err:${part.toolCallId}`;
+            if (!this.seenToolCallIds.has(countKey)) {
+              this.seenToolCallIds.add(countKey);
+              const inputSize = JSON.stringify(input).length;
+              const prunedSize = JSON.stringify(prunedInput).length;
+              this.stats.estimatedTokensSaved += Math.max(0, Math.floor((inputSize - prunedSize) / 4));
+              this.stats.prunedParts++;
+              counts.error++;
+            }
+
+            msgModified = true;
+            return { ...part, input: prunedInput };
+          });
+
+          if (msgModified) {
+            messages[i] = { ...asstMsg, content: newContent as unknown as ContextAssistantMessage['content'] };
+            changed = true;
           }
-          if (!inputModified) return part;
-
-          // Count stats only once per tool call
-          const countKey = `err:${part.toolCallId}`;
-          if (!this.seenToolCallIds.has(countKey)) {
-            this.seenToolCallIds.add(countKey);
-            const inputSize = JSON.stringify(input).length;
-            const prunedSize = JSON.stringify(prunedInput).length;
-            this.stats.estimatedTokensSaved += Math.max(0, Math.floor((inputSize - prunedSize) / 4));
-            this.stats.prunedParts++;
-            counts.error++;
-          }
-
-          msgModified = true;
-          return { ...part, input: prunedInput };
-        });
-
-        if (msgModified) {
-          messages[i] = { ...asstMsg, content: newContent as unknown as ContextAssistantMessage['content'] };
-          changed = true;
         }
       }
-    }
+    } // end purgeErrors
 
-    // --- Phase 6: Inject prunable-tools context ---
-    const prunableContext = this.buildPrunableToolsContext(messages, toolCalls);
-    if (prunableContext) {
-      // Find the last user message and append the prunable-tools context
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role === 'user') {
-          const userMsg = messages[i] as ContextMessage & { role: 'user'; content: string };
-          messages[i] = { ...userMsg, content: userMsg.content + '\n\n' + prunableContext };
-          changed = true;
-          break;
+    // --- Phase 6: Inject prunable-tools context (skip in manual mode) ---
+    if (!this.config.manualMode) {
+      const prunableContext = this.buildPrunableToolsContext(messages, toolCalls);
+      if (prunableContext) {
+        // Find the last user message and append the prunable-tools context
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === 'user') {
+            const userMsg = messages[i] as ContextMessage & { role: 'user'; content: string };
+            messages[i] = { ...userMsg, content: userMsg.content + '\n\n' + prunableContext };
+            changed = true;
+            break;
+          }
         }
       }
-    }
+    } // end prunable-tools injection
 
     // --- Feedback ---
     if (changed) {
       const total = counts.duplicate + counts.supersede + counts.error + counts.manual + counts.distill;
       const newlyPruned = this.seenToolCallIds.size - seenSizeBefore;
-      if (total > 0 && newlyPruned > 0) {
+      if (total > 0 && newlyPruned > 0 && this.config.pruneNotification !== 'off') {
         const parts: string[] = [];
         if (counts.duplicate) parts.push(`${counts.duplicate} duplicate`);
         if (counts.supersede) parts.push(`${counts.supersede} supersede`);
@@ -568,8 +643,13 @@ export default class DCPExtension implements Extension {
         if (counts.manual) parts.push(`${counts.manual} manual`);
         if (counts.distill) parts.push(`${counts.distill} distill`);
 
-        const detail = parts.length > 0 ? ` (${parts.join(', ')})` : '';
-        const summary = `DCP: Pruned ${total} output(s)${detail} — ±${this.stats.estimatedTokensSaved} tokens saved total`;
+        let summary: string;
+        if (this.config.pruneNotification === 'minimal') {
+          summary = `DCP: Pruned ${total} output(s) — ±${this.stats.estimatedTokensSaved} tokens saved`;
+        } else {
+          const detail = parts.length > 0 ? ` (${parts.join(', ')})` : '';
+          summary = `DCP: Pruned ${total} output(s)${detail} — ±${this.stats.estimatedTokensSaved} tokens saved total`;
+        }
 
         context.log(summary, 'info');
         const taskContext = context.getTaskContext();
@@ -585,8 +665,10 @@ export default class DCPExtension implements Extension {
   // --- Tools ---
 
   getTools(_context: ExtensionContext, _mode: string, _agentProfile: AgentProfile): ToolDefinition[] {
-    return [
-      {
+    const tools: ToolDefinition[] = [];
+
+    if (this.config.enabled && this.config.tools.prune) {
+      tools.push({
         name: 'dcp-prune',
         description:
           'Mark specific tool messages for pruning. Their outputs will be replaced with a placeholder before the next LLM request. Use this to remove obsolete or noisy tool outputs from conversation history.',
@@ -595,7 +677,12 @@ export default class DCPExtension implements Extension {
           reason: z.string().optional().describe('Reason for pruning (shown in placeholder)')
         }),
         execute: async (input, _signal, extContext) => {
-          const ids = input.messageIds as string[];
+          const ids = (input.messageIds as string[]).filter(id => id && id !== 'undefined');
+          if (ids.length === 0) {
+            const msg = 'DCP: No valid message IDs provided — nothing to prune';
+            extContext.log(msg, 'warn');
+            return msg;
+          }
           ids.forEach(id => this.manuallyPrunedIds.add(id));
           const msg = `DCP: Marked ${ids.length} message(s) for pruning — will take effect on next request`;
           extContext.log(msg, 'info');
@@ -603,8 +690,11 @@ export default class DCPExtension implements Extension {
           if (taskContext) taskContext.addLogMessage('info', msg);
           return msg;
         }
-      },
-      {
+      });
+    }
+
+    if (this.config.enabled && this.config.tools.distill) {
+      tools.push({
         name: 'dcp-distill',
         description:
           'Preserve a concise summary of key findings from a range of messages, then prune all tool outputs in that range. Call this after completing a research phase to reduce context while retaining insights.',
@@ -630,8 +720,10 @@ export default class DCPExtension implements Extension {
           if (taskContext) taskContext.addLogMessage('info', msg);
           return msg;
         }
-      }
-    ];
+      });
+    }
+
+    return tools;
   }
 
   // --- Commands ---
@@ -640,15 +732,15 @@ export default class DCPExtension implements Extension {
     return [
       {
         name: 'dcp',
-        description: 'Manage Dynamic Context Pruning — subcommands: context, stats, sweep [count], reset',
-        arguments: [{ description: 'Subcommand: context | stats | sweep [count] | reset', required: false }],
+        description: 'Manage Dynamic Context Pruning — subcommands: stats, sweep [count], reset',
+        arguments: [{ description: 'Subcommand: stats | sweep [count] | reset', required: false }],
         execute: async (args, extContext) => {
           const sub = args[0];
           const taskContext = extContext.getTaskContext();
 
           if (sub === 'stats') {
             const msg =
-              `DCP Stats — ${this.stats.prunedParts} part(s) pruned total, ` +
+              `DCP Stats: ${this.stats.prunedParts} part(s) pruned total, ` +
               `±${this.stats.estimatedTokensSaved} tokens saved, ` +
               `${this.distilledRanges.length} active distillation range(s), ` +
               `${this.manuallyPrunedIds.size} message(s) marked for manual pruning`;
@@ -680,20 +772,12 @@ export default class DCPExtension implements Extension {
             const msg = 'DCP: State reset — all stats, prune marks, and distillation ranges cleared';
             extContext.log(msg, 'info');
             if (taskContext) taskContext.addLogMessage('info', msg);
-          } else if (sub === 'context') {
-            const msg =
-              `DCP Context: ${this.stats.prunedParts} output(s) pruned, ` +
-              `±${this.stats.estimatedTokensSaved} tokens saved, ` +
-              `${this.distilledRanges.length} distillation range(s), ` +
-              `${this.manuallyPrunedIds.size} pending manual prune(s)`;
-            extContext.log(msg, 'info');
-            if (taskContext) taskContext.addLogMessage('info', msg);
           } else if (!sub) {
-            const msg = 'DCP commands: /dcp context | /dcp stats | /dcp sweep [count] | /dcp reset';
+            const msg = 'DCP commands: /dcp stats | /dcp sweep [count] | /dcp reset';
             extContext.log(msg, 'info');
             if (taskContext) taskContext.addLogMessage('info', msg);
           } else {
-            const help = `DCP: Unknown subcommand "${sub}". Available: context, stats, sweep, reset`;
+            const help = `DCP: Unknown subcommand "${sub}". Available: stats, sweep, reset`;
             extContext.log(help, 'warn');
             if (taskContext) taskContext.addLogMessage('warning', help);
           }
